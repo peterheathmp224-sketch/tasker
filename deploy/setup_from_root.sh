@@ -14,8 +14,19 @@ REPO_URL="https://github.com/peterheathmp224-sketch/tasker"
 
 echo "==> 1. Системные пакеты (единственное место, где нужен root)"
 apt-get update
-apt-get install -y python3 python3-venv python3-pip git docker.io docker-compose-plugin curl
+apt-get install -y python3 python3-venv python3-pip git docker.io curl
 systemctl enable --now docker
+# docker compose: plugin (Ubuntu 22.04+) либо v1-пакет, либо бинарник с GitHub
+if apt-get install -y docker-compose-plugin 2>/dev/null; then
+  COMPOSE="docker compose"
+elif apt-get install -y docker-compose 2>/dev/null; then
+  COMPOSE="docker-compose"
+else
+  curl -SL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+  chmod +x /usr/local/bin/docker-compose
+  COMPOSE="docker-compose"
+fi
+$COMPOSE version
 usermod -aG docker tasker
 
 echo "==> 2. Код в домашней папке tasker"
@@ -41,7 +52,7 @@ chmod 600 "$APP_DIR/backend/.env"
 
 echo "==> 5. Postgres 16 (системный Docker, данные в docker-volume)"
 cd "$APP_DIR"
-docker compose up -d db
+$COMPOSE up -d db
 for i in $(seq 1 30); do
   docker exec tasker-db-1 pg_isready -U tasker 2>/dev/null && break || sleep 2
 done
