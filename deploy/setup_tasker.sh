@@ -14,10 +14,25 @@ echo "==> 0. Кто мы (должен быть tasker, без sudo)"
 whoami
 if [ "$(whoami)" != "tasker" ]; then echo "Зайди как tasker: su - tasker"; exit 1; fi
 
-echo "==> 1. Python venv в домашней папке"
+echo "==> 1. Python venv в домашней папке (без sudo/apt)"
 python3 --version
 [ -d "$APP_DIR/backend" ] || { echo "Скопируй проект в $APP_DIR (git clone ... $APP_DIR)"; exit 1; }
-[ -x "$VENV_DIR/bin/python" ] || python3 -m venv "$VENV_DIR"
+ensure_venv() {
+  # 1) системный venv, если есть
+  python3 -m venv "$VENV_DIR" 2>/dev/null && return 0
+  # 2) virtualenv в юзерспейс (без sudo)
+  python3 -m ensurepip --user 2>/dev/null || true
+  python3 -m pip install --user virtualenv 2>/dev/null || return 1
+  python3 -m virtualenv "$VENV_DIR" && return 0
+  return 1
+}
+if [ ! -x "$VENV_DIR/bin/python" ]; then
+  ensure_venv || {
+    echo "Нет модуля venv и не встал virtualenv. Запасной вариант — uv:";
+    echo "  curl -LsSf https://astral.sh/uv/install.sh | sh && ~/.local/bin/uv venv $VENV_DIR";
+    exit 1;
+  }
+fi
 "$VENV_DIR/bin/pip" install --upgrade pip
 "$VENV_DIR/bin/pip" install -r "$APP_DIR/backend/requirements.txt"
 
