@@ -1,6 +1,6 @@
 """Shared helpers: current user from X-Telegram-Init-Data header, task serialization."""
 import os
-from fastapi import Header, Depends
+from fastapi import Header, Depends, Query
 from sqlalchemy.orm import Session
 from .database import get_db
 from . import models
@@ -9,8 +9,15 @@ from .auth import validate_init_data, mock_user
 DEV_MOCK = os.getenv("DEV_MOCK_USER", "true").lower() == "true"
 
 
-def get_current_user(x_telegram_init_data: str = Header(default=""), db: Session = Depends(get_db)) -> models.User:
-    tg = validate_init_data(x_telegram_init_data) if x_telegram_init_data else None
+def get_current_user(
+    x_telegram_init_data: str = Header(default=""),
+    initData: str = Query(default=""),
+    db: Session = Depends(get_db),
+) -> models.User:
+    # initData query-параметр — для скачивания файлов через openLink во внешнем
+    # браузере, куда заголовки не передать. Заголовок в приоритете.
+    raw = x_telegram_init_data or initData
+    tg = validate_init_data(raw) if raw else None
     if tg is None and DEV_MOCK:
         tg = mock_user()
     if tg is None:

@@ -292,13 +292,21 @@
         t = await api.task(id);
         view();
       });
-      // Скачивание через fetch+blob: в Telegram WebView прямая ссылка с
-      // target=_blank открывает пустое окно вместо сохранения файла.
+      // Скачивание: в Telegram WebView программное сохранение blob игнорируется,
+      // поэтому открываем файл во внешнем браузере через openLink (там работает).
+      // initData едет query-параметром — заголовки через openLink не передать.
+      // В обычном браузере качаем через fetch+blob без ухода со страницы.
       app.querySelectorAll("[data-dl-file]").forEach((a) => a.onclick = async (e) => {
         e.preventDefault();
         const fname = a.dataset.fname || "file";
+        const base = a.getAttribute("href");
+        if (tg && tg.openLink) {
+          const url = base + (base.indexOf("?") >= 0 ? "&" : "?") + "initData=" + encodeURIComponent(initData());
+          try { tg.openLink(url); } catch (err) { window.open(url, "_blank"); }
+          return;
+        }
         try {
-          const r = await fetch(a.getAttribute("href"), { headers: { "X-Telegram-Init-Data": initData() } });
+          const r = await fetch(base, { headers: { "X-Telegram-Init-Data": initData() } });
           if (!r.ok) throw new Error(await r.text());
           const obj = URL.createObjectURL(await r.blob());
           const link = document.createElement("a");

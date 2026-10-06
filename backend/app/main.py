@@ -37,7 +37,7 @@ def auth(_: AuthIn, user: models.User = Depends(get_current_user)):
 # ---- static Mini App (no node build) ----
 # APP_VERSION bump on every web/ change — cache-buster for Telegram WebView,
 # which aggressively caches /app.js (stale JS = stale API queries).
-APP_VERSION = "9"
+APP_VERSION = "10"
 NO_STORE = {"Cache-Control": "no-store, no-cache, must-revalidate"}
 WEB_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), "web")
 if os.path.isdir(WEB_DIR):
