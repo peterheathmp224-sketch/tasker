@@ -1,0 +1,18 @@
+[Unit]
+Description=Tasker FastAPI (system service, runs as tasker)
+After=network-online.target docker.service
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=simple
+User=tasker
+Group=tasker
+WorkingDirectory=/home/tasker/tasker/backend
+EnvironmentFile=/home/tasker/tasker/backend/.env
+ExecStart=/home/tasker/tasker/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

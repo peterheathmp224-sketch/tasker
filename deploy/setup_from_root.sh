@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Установка Tasker от root, но ВСЁ работает от пользователя tasker.
+# Запуск на сервере под root:  bash deploy/setup_from_root.sh
+# Что делает: ставит системные пакеты, код и venv живут в /home/tasker,
+# Postgres — в системном Docker, backend — системный systemd-юнит с User=tasker.
+set -euo pipefail
+
+[ "$(id -u)" -eq 0 ] || { echo "Запусти как root (sudo -i)"; exit 1; }
+id tasker >/dev/null 2>&1 || { echo "Нет пользователя tasker: adduser tasker"; exit 1; }
+
+APP_DIR="/home/tasker/tasker"
+VENV_DIR="/home/tasker/tasker/.venv"
+REPO_URL="https://github.com/peterheathmp224-sketch/tasker"
+
+echo "==> 1. Системные пакеты (единственное место, где нужен root)"
+apt-get update
+apt-get install -y python3 python3-venv python3-pip git docker.io docker-compose-plugin curl
+systemctl enable --now docker
+usermod -aG docker tasker
+
+echo "==> 2. Код в домашней папке tasker"
+if [ ! -d "$APP_DIR/backend" ]; then
+  sudo -u tasker git clone "$REPO_URL" "$APP_DIR"
+else
+  su - tasker -c "cd $APP_DIR && git pull"
+fi
+chown -R tasker:tasker /home/tasker/tasker
+
+echo "==> 3. venv + зависимости (от имени tasker)"
+su - tasker -c "python3 -m venv $VENV_DIR"
+su - tasker -c "$VENV_DIR/bin/pip install --upgrade pip"
+su - tasker -c "$VENV_DIR/bin/pip install -r $APP_DIR/backend/requirements.txt"
+
+echo "==> 4. .env (владелец tasker, chmod 600)"
+if [ ! -f "$APP_DIR/backend/.env" ]; then
+  sudo -u tasker cp "$APP_DIR/backend/.env.example" "$APP_DIR/backend/.env"
+  echo "!!! Впиши секреты: nano $APP_DIR/backend/.env (BOT_TOKEN, DEV_MOCK_USER=false)"
+fi
+chown tasker:tasker "$APP_DIR/backend/.env"
+chmod 600 "$APP_DIR/backend/.env"
+
+echo "==> 5. Postgres 16 (системный Docker, данные в docker-volume)"
+cd "$APP_DIR"
+docker compose up -d db
+for i in $(seq 1 30); do
+  docker exec tasker-db-1 pg_isready -U tasker 2>/dev/null && break || sleep 2
+done
+
+echo "==> 6. systemd-сервис (системный юнит, процесс от tasker)"
+cp "$APP_DIR/deploy/tasker-system.service" /etc/systemd/system/tasker.service
+systemctl daemon-reload
+systemctl enable --now tasker
+sleep 3
+systemctl status tasker --no-pager || true
+curl -s http://127.0.0.1:8000/api/health && echo " <- backend OK"
+
+echo ""
+echo "Готово. Проверка владения (всё должно быть tasker):"
+ls -ld "$APP_DIR" "$VENV_DIR"
+ps -o user=,cmd= -C uvicorn 2>/dev/null || ps aux | grep '[u]vicorn' | head -3
+echo "Логи: journalctl -u tasker -f | Перезапуск после деплоя: systemctl restart tasker"
