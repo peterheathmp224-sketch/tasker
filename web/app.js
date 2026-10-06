@@ -64,12 +64,12 @@
     const list = t.attachments || [];
     return '<h3>Файлы (' + list.length + ")</h3>" +
       (list.map((a) =>
-        '<div class="row file-row"><a style="flex:1" href="' + esc(a.url || attachmentUrl(t.id, a.id)) + '" target="_blank" rel="noopener">📎 ' +
+        '<div class="row file-row"><a style="flex:1" href="' + esc(a.url || attachmentUrl(t.id, a.id)) + '" data-dl-file="' + a.id + '" data-fname="' + esc(a.filename) + '">📎 ' +
         esc(a.filename) + ' <span class="muted">(' + esc(fmtSize(a.size)) + ")</span></a>" +
         '<button class="ghost" data-del-file="' + a.id + '">✕</button></div>'
       ).join("") || '<p class="muted">Файлов пока нет</p>') +
       '<div class="row" style="margin-top:6px"><input id="f-file" type="file" multiple><button id="f-upload">Прикрепить</button></div>' +
-      '<p class="muted">Хранятся в БД, до 10 МБ каждый.</p>';
+      '<p class="muted">До 10 МБ каждый.</p>';
   }
 
   function avatars(list) {
@@ -244,7 +244,7 @@
       groups.map((g) => '<option value="' + g.id + '">' + esc(g.name) + "</option>").join("") + "</select>" +
       "<label>Исполнители (нажми, чтобы выбрать):</label>" +
       '<div id="f-pick"></div>' +
-      "<label>Файлы (до 10 МБ каждый, сохранятся в БД):</label>" +
+      "<label>Файлы (до 10 МБ каждый):</label>" +
       '<input id="f-files" type="file" multiple>' +
       '<button id="f-go" style="margin-top:8px;width:100%">Создать</button>';
     const picker = peoplePicker(document.getElementById("f-pick"), users, []);
@@ -291,6 +291,24 @@
         await api.deleteAttachment(id, b.dataset.delFile);
         t = await api.task(id);
         view();
+      });
+      // Скачивание через fetch+blob: в Telegram WebView прямая ссылка с
+      // target=_blank открывает пустое окно вместо сохранения файла.
+      app.querySelectorAll("[data-dl-file]").forEach((a) => a.onclick = async (e) => {
+        e.preventDefault();
+        const fname = a.dataset.fname || "file";
+        try {
+          const r = await fetch(a.getAttribute("href"), { headers: { "X-Telegram-Init-Data": initData() } });
+          if (!r.ok) throw new Error(await r.text());
+          const obj = URL.createObjectURL(await r.blob());
+          const link = document.createElement("a");
+          link.href = obj;
+          link.download = fname;
+          document.body.appendChild(link);
+          link.click();
+          link.remove();
+          setTimeout(() => URL.revokeObjectURL(obj), 5000);
+        } catch (err) { alert("Не удалось скачать файл"); }
       });
       const upBtn = document.getElementById("f-upload");
       if (upBtn) upBtn.onclick = async () => {
