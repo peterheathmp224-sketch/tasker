@@ -36,6 +36,8 @@ $COMPOSE version
 usermod -aG docker tasker
 
 echo "==> 2. Код в домашней папке tasker"
+# root мог раньше трогать .git (pull под root) — возвращаем владение tasker ДО git-операций
+chown -R tasker:tasker "$APP_DIR"
 if [ ! -d "$APP_DIR/backend" ]; then
   sudo -u tasker git clone "$REPO_URL" "$APP_DIR"
 else
