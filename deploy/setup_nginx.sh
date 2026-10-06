@@ -10,6 +10,17 @@ DOMAIN="tasks.immortalhokage.space"
 EMAIL="${EMAIL:-}"
 APP_DIR="/home/tasker/tasker"
 
+echo "==> 0. Проверка: порты 80/443 свободны"
+for PORT in 80 443; do
+  if command -v ss >/dev/null 2>&1 && ss -tln 2>/dev/null | grep -qE ":$PORT\\b"; then
+    echo "Порт $PORT уже занят:"
+    ss -tlnp 2>/dev/null | grep -E ":$PORT\\b" || true
+    echo "Останови чужой сервис (или удали его контейнер) и запусти скрипт заново."
+    exit 1
+  fi
+done
+echo "Порты 80/443 свободны."
+
 echo "==> 1. nginx + certbot"
 apt-get update
 apt-get install -y nginx certbot python3-certbot-nginx
