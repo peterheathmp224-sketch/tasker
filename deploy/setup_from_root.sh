@@ -17,14 +17,16 @@ apt-get update
 apt-get install -y python3 python3-venv python3-pip git docker.io curl
 systemctl enable --now docker
 # docker compose: plugin (Ubuntu 22.04+) либо v1-пакет, либо бинарник с GitHub
-if apt-get install -y docker-compose-plugin 2>/dev/null; then
+# (проверяем реальную работу команды, а не только код выхода apt)
+COMPOSE=""
+if apt-get install -y docker-compose-plugin 2>/dev/null && docker compose version >/dev/null 2>&1; then
   COMPOSE="docker compose"
-elif apt-get install -y docker-compose 2>/dev/null; then
+elif apt-get install -y docker-compose 2>/dev/null && docker-compose version >/dev/null 2>&1; then
   COMPOSE="docker-compose"
 else
-  curl -SL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
+  curl -fSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose
   chmod +x /usr/local/bin/docker-compose
-  COMPOSE="docker-compose"
+  COMPOSE="/usr/local/bin/docker-compose"
 fi
 $COMPOSE version
 usermod -aG docker tasker
@@ -54,7 +56,8 @@ echo "==> 5. Postgres 16 (системный Docker, данные в docker-volu
 cd "$APP_DIR"
 $COMPOSE up -d db
 for i in $(seq 1 30); do
-  docker exec tasker-db-1 pg_isready -U tasker 2>/dev/null && break || sleep 2
+  # через $COMPOSE exec: работает и в v1 (tasker_db_1), и в v2 (tasker-db-1)
+  $COMPOSE exec -T db pg_isready -U tasker 2>/dev/null && break || sleep 2
 done
 
 echo "==> 6. systemd-сервис (системный юнит, процесс от tasker)"
