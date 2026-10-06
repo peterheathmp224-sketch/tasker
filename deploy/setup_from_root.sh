@@ -12,6 +12,10 @@ APP_DIR="/home/tasker/tasker"
 VENV_DIR="/home/tasker/tasker/.venv"
 REPO_URL="https://github.com/peterheathmp224-sketch/tasker"
 
+# git под root отказывается трогать чужие файлы (dubious ownership) — разрешаем явно
+git config --global --add safe.directory "$APP_DIR" 2>/dev/null || true
+su - tasker -c "git config --global --add safe.directory $APP_DIR" 2>/dev/null || true
+
 echo "==> 1. Системные пакеты (единственное место, где нужен root)"
 apt-get update
 apt-get install -y python3 python3-venv python3-pip git docker.io curl
