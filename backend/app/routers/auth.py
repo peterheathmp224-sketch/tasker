@@ -1,7 +1,7 @@
 """Браузерный вход через Telegram Login Widget + публичный конфиг для фронта."""
 import os
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 from ..database import get_db
 from .. import models
@@ -11,6 +11,10 @@ router = APIRouter(prefix="/api/auth", tags=["auth"])
 
 
 class WidgetAuthIn(BaseModel):
+    # extra="allow": Telegram может прислать только подмножество полей
+    # (нет username/photo_url и т.д.). Неизвестные поля тоже учитываем в hash.
+    model_config = ConfigDict(extra="allow")
+
     id: int
     first_name: str = ""
     last_name: str = ""
@@ -38,7 +42,10 @@ def login_widget(payload: WidgetAuthIn, db: Session = Depends(get_db)):
     ok, _ = _widget_enabled()
     if not ok:
         raise HTTPException(503, "telegram login is not configured (BOT_USERNAME/BOT_TOKEN)")
-    tg = validate_widget_data(payload.model_dump())
+    # exclude_unset=True: в подпись входят ТОЛЬКО поля, присланные Telegram.
+    # Пустые дефолты модели (photo_url="" и т.д.) в hash не добавляем,
+    # иначе подпись всегда "bad telegram signature", когда поля нет в виджете.
+    tg = validate_widget_data(payload.model_dump(exclude_unset=True, exclude_none=True))
     if tg is None:
         raise HTTPException(401, "bad telegram signature")
     uid = int(tg["id"])

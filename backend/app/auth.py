@@ -16,13 +16,14 @@ WIDGET_TTL_SECONDS = 24 * 3600
 
 def validate_init_data(init_data: str) -> dict | None:
     """Return telegram user dict if valid, else None. Empty/BOT_TOKEN placeholder => None."""
-    if not init_data or not BOT_TOKEN or "PUT-YOUR-TOKEN" in BOT_TOKEN:
+    token = (os.getenv("BOT_TOKEN", "") or BOT_TOKEN).strip()
+    if not init_data or not token or "PUT-YOUR-TOKEN" in token:
         return None
     try:
         pairs = dict(urllib.parse.parse_qsl(init_data, keep_blank_values=True))
         recv_hash = pairs.pop("hash", "")
         data_check = "\n".join(f"{k}={pairs[k]}" for k in sorted(pairs))
-        secret = hmac.new(b"WebAppData", BOT_TOKEN.encode(), hashlib.sha256).digest()
+        secret = hmac.new(b"WebAppData", token.encode(), hashlib.sha256).digest()
         calc = hmac.new(secret, data_check.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, recv_hash):
             return None
@@ -41,7 +42,7 @@ def validate_widget_data(data: dict) -> dict | None:
     См. https://core.telegram.org/widgets/login#checking-authorization
     Возвращает dict юзера при валидной подписи, иначе None.
     """
-    token = os.getenv("BOT_TOKEN", "") or BOT_TOKEN
+    token = (os.getenv("BOT_TOKEN", "") or BOT_TOKEN).strip()
     if not data or not token or "PUT-YOUR-TOKEN" in token:
         return None
     try:
@@ -52,7 +53,9 @@ def validate_widget_data(data: dict) -> dict | None:
         now = int(time.time())
         if auth_date > now + 300 or now - auth_date > WIDGET_TTL_SECONDS:
             return None
-        check = "\n".join(f"{k}={data[k]}" for k in sorted(data) if k != "hash")
+        # Только присланные поля (без hash). Пустые дефолты сюда попадать не должны —
+        # вызывающий код передает exclude_unset=True.
+        check = "\n".join(f"{k}={data[k]}" for k in sorted(data) if k != "hash" and data[k] is not None)
         secret = hashlib.sha256(token.encode()).digest()
         calc = hmac.new(secret, check.encode(), hashlib.sha256).hexdigest()
         if not hmac.compare_digest(calc, recv_hash):
