@@ -13,12 +13,13 @@ def me(user: models.User = Depends(get_current_user)):
 
 
 @router.get("")
-def list_users(search: str = "", db: Session = Depends(get_db), _: models.User = Depends(get_current_user)):
+def list_users(search: str = "", limit: int = 50, db: Session = Depends(get_db), _: models.User = Depends(get_current_user)):
+    limit = max(1, min(limit, 100))
     q = db.query(models.User)
     if search:
         s = f"%{search.strip().lstrip('@').lower()}%"
         q = q.filter(models.User.username.ilike(s))
     return [
         {"tg_id": u.tg_id, "username": u.username, "first_name": u.first_name, "photo_url": u.photo_url}
-        for u in q.limit(50).all()
+        for u in q.order_by(models.User.tg_id).limit(limit).all()
     ]

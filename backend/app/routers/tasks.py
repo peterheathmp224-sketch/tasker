@@ -1,9 +1,11 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, BackgroundTasks
 from fastapi.responses import Response
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from ..database import get_db
 from .. import models, schemas
-from ..deps import get_current_user, serialize_task
+from ..deps import get_current_user, serialize_task, serialize_tasks
+from .. import notify
 
 router = APIRouter(prefix="/api/tasks", tags=["tasks"])
 
@@ -11,8 +13,12 @@ MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 МБ — файлы хранятся в �
 
 
 def _ensure_users(db: Session, ids: list[int]):
-    for uid in ids:
-        if not db.get(models.User, uid):
+    uniq = list(set(ids))
+    if not uniq:
+        return
+    have = {r[0] for r in db.query(models.User.tg_id).filter(models.User.tg_id.in_(uniq)).all()}
+    for uid in uniq:
+        if uid not in have:
             db.add(models.User(tg_id=uid))
     db.commit()
 
@@ -20,29 +26,31 @@ def _ensure_users(db: Session, ids: list[int]):
 @router.get("")
 def list_tasks(
     assignee: str = "", status: str = "", group_id: int | None = None, scope: str = "",
+    limit: int = Query(default=200, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db), user: models.User = Depends(get_current_user),
 ):
     q = db.query(models.Task)
     if group_id is not None:
         q = q.filter(models.Task.group_id == group_id)
     elif scope == "group":
-        # без group_id — задачи всех групп пользователя (для календаря scope=Группа)
-        gids = [r.group_id for r in db.query(models.GroupMember).filter_by(user_id=user.tg_id).all()]
-        if not gids:
-            return []
-        q = q.filter(models.Task.group_id.in_(gids))
+        # без group_id — задачи всех групп пользователя.
+        # Подзапрос вместо выгрузки всех memberships в Python.
+        my_gids = select(models.GroupMember.group_id).where(models.GroupMember.user_id == user.tg_id).scalar_subquery()
+        q = q.filter(models.Task.group_id.in_(my_gids))
     if status:
         q = q.filter(models.Task.status == status)
-    tasks = q.order_by(models.Task.deadline.is_(None), models.Task.deadline).all()
-    out = [serialize_task(db, t) for t in tasks]
     if assignee == "me":
-        # только прямые исполнители (t["assignees"] — direct, см. serialize_task)
-        out = [t for t in out if any(a["tg_id"] == user.tg_id for a in t["assignees"])]
-    return out
+        # Только прямые исполнители — фильтруем в SQL ДО сериализации,
+        # раньше грузились и сериализовались ВСЕ задачи, потом отбрасывались.
+        my_tasks = select(models.TaskAssignee.task_id).where(models.TaskAssignee.user_id == user.tg_id).scalar_subquery()
+        q = q.filter(models.Task.id.in_(my_tasks))
+    tasks = q.order_by(models.Task.deadline.is_(None), models.Task.deadline).limit(limit).offset(offset).all()
+    return serialize_tasks(db, tasks)
 
 
 @router.post("", status_code=201)
-def create_task(payload: schemas.TaskCreate, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
+def create_task(payload: schemas.TaskCreate, bg: BackgroundTasks, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     if payload.status not in schemas.STATUSES:
         raise HTTPException(400, "bad status")
     t = models.Task(
@@ -52,14 +60,17 @@ def create_task(payload: schemas.TaskCreate, db: Session = Depends(get_db), user
     )
     db.add(t)
     db.commit()
-    db.refresh(t)
     if payload.assignee_ids:
         _ensure_users(db, payload.assignee_ids)
         for uid in set(payload.assignee_ids):
             db.add(models.TaskAssignee(task_id=t.id, user_id=uid))
         db.commit()
-        db.refresh(t)
-    return serialize_task(db, t)
+    out = serialize_task(db, t)
+    # Уведомление участникам (прямые исполнители + группа), кроме постановщика.
+    recips = (set(payload.assignee_ids or []) | notify.group_members(db, payload.group_id)) - {user.tg_id}
+    if recips:
+        bg.add_task(notify.broadcast, sorted(recips), notify.task_created(out, notify.actor_out(user)))
+    return out
 
 
 @router.get("/{task_id}")
@@ -71,7 +82,7 @@ def get_task(task_id: int, db: Session = Depends(get_db), _: models.User = Depen
 
 
 @router.patch("/{task_id}")
-def update_task(task_id: int, payload: schemas.TaskUpdate, db: Session = Depends(get_db), _: models.User = Depends(get_current_user)):
+def update_task(task_id: int, payload: schemas.TaskUpdate, bg: BackgroundTasks, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     # anyone can edit (v1 rule)
     t = db.get(models.Task, task_id)
     if not t:
@@ -80,28 +91,66 @@ def update_task(task_id: int, payload: schemas.TaskUpdate, db: Session = Depends
     assignees = data.pop("assignee_ids", None)
     if "status" in data and data["status"] not in schemas.STATUSES:
         raise HTTPException(400, "bad status")
+    old_status, old_group, old_deadline = t.status, t.group_id, t.deadline
+    old_assignees = {a.user_id for a in (t.assignees or [])}
     for k, v in data.items():
         setattr(t, k, v)
     db.commit()
     if assignees is not None:
         _ensure_users(db, assignees)
+        # Bulk-delete выполняется немедленным SQL (в отличие от db.delete(),
+        # который откладывается до flush и бьётся о UNIQUE при замене состава).
         db.query(models.TaskAssignee).filter_by(task_id=t.id).delete()
         for uid in set(assignees):
             db.add(models.TaskAssignee(task_id=t.id, user_id=uid))
         db.commit()
-        db.refresh(t)
-    return serialize_task(db, t)
+        # Коллекция t.assignees в памяти протухла — один SELECT ради свежего чтения.
+        db.expire(t, ["assignees"])
+    new_assignees = set(assignees) if assignees is not None else old_assignees
+    out = serialize_task(db, t)
+    actor, me = notify.actor_out(user), user.tg_id
+    jobs: list[tuple[set[int], str]] = []
+    status_changed = "status" in data and data["status"] != old_status
+    if status_changed:
+        recips = notify.task_participants(db, t.id, t.group_id, t.created_by) - {me}
+        jobs.append((recips, notify.task_status(out, actor, old_status, t.status)))
+    if assignees is not None:
+        added, removed = (new_assignees - old_assignees) - {me}, (old_assignees - new_assignees) - {me}
+        if added:
+            jobs.append((added, notify.task_assignee_added(out, actor)))
+        if removed:
+            jobs.append((removed, notify.task_assignee_removed(out, actor)))
+    if "group_id" in data and t.group_id != old_group:
+        if t.group_id:
+            gname = notify.group_name(db, t.group_id)
+            if gname:
+                jobs.append((notify.group_members(db, t.group_id) - {me}, notify.task_group_attached(out, actor, gname)))
+        if old_group:
+            gname = notify.group_name(db, old_group)
+            if gname:
+                jobs.append((notify.group_members(db, old_group) - {me}, notify.task_group_detached(out, actor, gname)))
+    if "deadline" in data and data["deadline"] != old_deadline and not status_changed:
+        recips = notify.task_participants(db, t.id, t.group_id, t.created_by) - {me}
+        jobs.append((recips, notify.task_deadline_changed(out, actor, old_deadline, t.deadline)))
+    for recips, text in jobs:
+        if recips:
+            bg.add_task(notify.broadcast, sorted(recips), text)
+    return out
 
 
 @router.delete("/{task_id}")
-def delete_task(task_id: int, db: Session = Depends(get_db), _: models.User = Depends(get_current_user)):
+def delete_task(task_id: int, bg: BackgroundTasks, db: Session = Depends(get_db), user: models.User = Depends(get_current_user)):
     t = db.get(models.Task, task_id)
     if not t:
         raise HTTPException(404, "not found")
-    db.query(models.TaskAssignee).filter_by(task_id=t.id).delete()
-    db.query(models.TaskAttachment).filter_by(task_id=t.id).delete()
+    title, deadline = t.title, t.deadline
+    recips = notify.task_participants(db, t.id, t.group_id, t.created_by) - {user.tg_id}
+    # Исполнители и файлы удаляются каскадом (delete-orphan) — отдельных bulk-delete
+    # не нужно (они же и давали двойное удаление + SAWarning).
     db.delete(t)
     db.commit()
+    if recips:
+        bg.add_task(notify.broadcast, sorted(recips), notify.task_deleted(title, deadline, notify.actor_out(user)))
     return {"ok": True}
 
 
@@ -131,6 +180,7 @@ def list_attachments(task_id: int, db: Session = Depends(get_db), _: models.User
 @router.post("/{task_id}/attachments", status_code=201)
 async def upload_attachment(
     task_id: int,
+    bg: BackgroundTasks,
     file: UploadFile = File(...),
     db: Session = Depends(get_db),
     user: models.User = Depends(get_current_user),
@@ -155,7 +205,12 @@ async def upload_attachment(
     )
     db.add(a)
     db.commit()
-    db.refresh(a)
+    recips = notify.task_participants(db, t.id, t.group_id, t.created_by) - {user.tg_id}
+    if recips:
+        bg.add_task(
+            notify.broadcast, sorted(recips),
+            notify.file_uploaded({"title": t.title}, notify.actor_out(user), a.filename, a.size),
+        )
     return _attachment_out(a)
 
 

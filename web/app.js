@@ -6,6 +6,9 @@
   try { tg && tg.ready(); tg && tg.expand(); } catch (e) {}
 
   const initData = () => { try { return (tg && tg.initData) || ""; } catch (e) { return ""; } };
+  const inTelegram = () => !!initData();
+  const sessionToken = () => { try { return localStorage.getItem("tasker_session") || ""; } catch (e) { return ""; } };
+  const setSessionToken = (t) => { try { if (t) localStorage.setItem("tasker_session", t); else localStorage.removeItem("tasker_session"); } catch (e) {} };
   const tgUser = () => { try { return (tg && tg.initDataUnsafe && tg.initDataUnsafe.user) || null; } catch (e) { return null; } };
   const STATUS_RU = { new: "Новая", in_progress: "В работе", done: "Готово" };
   const today = () => new Date().toISOString().slice(0, 10);
@@ -14,11 +17,15 @@
 
   async function req(path, opts) {
     opts = opts || {};
+    const headers = Object.assign({ "Content-Type": "application/json", "X-Telegram-Init-Data": initData() }, opts.headers || {});
+    const tok = sessionToken();
+    if (tok) headers["Authorization"] = "Bearer " + tok;
     const r = await fetch(path, {
       method: opts.method || "GET",
-      headers: Object.assign({ "Content-Type": "application/json", "X-Telegram-Init-Data": initData() }, opts.headers || {}),
+      headers: headers,
       body: opts.body ? JSON.stringify(opts.body) : undefined,
     });
+    if (r.status === 401) { const e = new Error(await r.text()); e.status = 401; throw e; }
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   }
@@ -44,11 +51,15 @@
   async function uploadAttachment(taskId, file) {
     const fd = new FormData();
     fd.append("file", file, file.name);
+    const headers = { "X-Telegram-Init-Data": initData() };
+    const tok = sessionToken();
+    if (tok) headers["Authorization"] = "Bearer " + tok;
     const r = await fetch("/api/tasks/" + taskId + "/attachments", {
       method: "POST",
-      headers: { "X-Telegram-Init-Data": initData() },
+      headers: headers,
       body: fd,
     });
+    if (r.status === 401) { const e = new Error(await r.text()); e.status = 401; throw e; }
     if (!r.ok) throw new Error(await r.text());
     return r.json();
   }
@@ -75,7 +86,7 @@
   function avatars(list) {
     return '<div class="avatars">' + (list || []).slice(0, 5).map((a) =>
       '<span class="av" title="' + esc(a.username || a.first_name || "") + '">' +
-      (a.photo_url ? '<img src="' + esc(a.photo_url) + '" alt="">' : esc((a.first_name || a.username || "?")[0])) +
+      (a.photo_url ? '<img loading="lazy" src="' + esc(a.photo_url) + '" alt="">' : esc((a.first_name || a.username || "?")[0])) +
       "</span>").join("") + "</div>";
   }
 
@@ -102,27 +113,35 @@
     const list = mount.querySelector(".picks");
     const count = mount.querySelector(".pick-count");
     const search = mount.querySelector(".pick-search");
+    let shownIds = [];
     function paint(filter) {
       const f = (filter || "").trim().toLowerCase();
       const shown = (users || []).filter((u) =>
         !f || (u.username || "").toLowerCase().includes(f) || (u.first_name || "").toLowerCase().includes(f));
+      shownIds = shown.map((u) => Number(u.tg_id));
       count.textContent = "Выбрано: " + sel.size;
       list.innerHTML = shown.map((u) => {
         const on = sel.has(Number(u.tg_id));
         return '<div class="pick' + (on ? " on" : "") + '" data-uid="' + u.tg_id + '">' +
-          '<span class="av">' + (u.photo_url ? '<img src="' + esc(u.photo_url) + '">' : esc(((u.first_name || u.username || "?"))[0])) + "</span>" +
+          '<span class="av">' + (u.photo_url ? '<img loading="lazy" src="' + esc(u.photo_url) + '">' : esc(((u.first_name || u.username || "?"))[0])) + "</span>" +
           '<span style="flex:1">@' + esc(u.username || u.tg_id) + " " + esc(u.first_name || "") + "</span>" +
           '<span class="pick-check">' + (on ? "✓" : "") + "</span></div>";
       }).join("") || '<p class="muted">Никого не найдено</p>';
-      list.querySelectorAll(".pick").forEach((el) => {
-        el.onclick = () => {
-          const id = Number(el.dataset.uid);
-          if (sel.has(id)) sel.delete(id); else sel.add(id);
-          paint(search.value);
-        };
-      });
     }
-    search.oninput = () => paint(search.value);
+    // Делегирование: один listener вместо N onclick + точечный апдейт без полного repaint.
+    list.onclick = (e) => {
+      const el = e.target && e.target.closest ? e.target.closest(".pick") : null;
+      if (!el || !list.contains(el)) return;
+      const id = Number(el.dataset.uid);
+      if (sel.has(id)) sel.delete(id); else sel.add(id);
+      const on = sel.has(id);
+      el.classList.toggle("on", on);
+      const check = el.querySelector(".pick-check");
+      if (check) check.textContent = on ? "✓" : "";
+      count.textContent = "Выбрано: " + sel.size;
+    };
+    let deb = 0;
+    search.oninput = () => { clearTimeout(deb); const v = search.value; deb = setTimeout(() => paint(v), 150); };
     paint("");
     return { get: () => [...sel] };
   }
@@ -135,25 +154,72 @@
   }
 
   // ---------- pages ----------
+  // Вход через Telegram для обычного браузера (Login Widget).
+  // Внутри Mini App не используется — там авторизация через initData.
+  async function pageLogin() {
+    let cfg = {};
+    try {
+      const r = await fetch("/api/auth/config");
+      cfg = await r.json();
+    } catch (e) { cfg = {}; }
+    if (!cfg.widget_enabled || !cfg.bot_username) {
+      app.innerHTML = "<h2>Tasker</h2><p>Открой приложение через Telegram — кнопка Menu у бота.</p>" +
+        '<p class="muted">Вход через браузер не настроен.</p>';
+      return;
+    }
+    app.innerHTML = "<h2>Вход через Telegram</h2>" +
+      '<p class="muted">Нажми кнопку ниже и подтверди вход в Telegram.</p>' +
+      '<div id="tg-login"></div><p class="muted" id="login-err"></p>';
+    const s = document.createElement("script");
+    s.async = true;
+    s.src = "https://telegram.org/js/telegram-widget.js?22";
+    s.setAttribute("data-telegram-login", cfg.bot_username);
+    s.setAttribute("data-size", "large");
+    s.setAttribute("data-onauth", "onTelegramAuth(user)");
+    s.setAttribute("data-request-access", "write");
+    document.getElementById("tg-login").appendChild(s);
+  }
+  window.onTelegramAuth = async (u) => {
+    try {
+      const r = await fetch("/api/auth/widget", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(u),
+      });
+      if (!r.ok) throw new Error(await r.text());
+      const data = await r.json();
+      setSessionToken(data.token);
+      route();
+    } catch (e) {
+      const el = document.getElementById("login-err");
+      if (el) el.textContent = "Не удалось войти: " + e.message;
+      else alert("Не удалось войти: " + e.message);
+    }
+  };
+
   async function pageProfile() {
+    // Параллельно: было 3 последовательных RTT, стало ~1.
+    const [meR, tasksR, groupsR] = await Promise.allSettled([api.me(), api.tasks("?assignee=me"), api.groups()]);
     let me = tgUser();
-    try { me = await api.me(); } catch (e) {}
-    let tasks = [], groups = [];
-    try { tasks = await api.tasks("?assignee=me"); } catch (e) {}
-    try { groups = await api.groups(); } catch (e) {}
+    if (meR.status === "fulfilled" && meR.value) me = meR.value;
+    const tasks = tasksR.status === "fulfilled" ? tasksR.value : [];
+    const groups = groupsR.status === "fulfilled" ? groupsR.value : [];
     const mine = (groups || []).filter((g) => (g.members || []).some((m) => me && m.tg_id === me.tg_id));
     app.innerHTML =
       '<div class="profile-head"><span class="av">' +
-      (me && me.photo_url ? '<img src="' + esc(me.photo_url) + '">' : esc(((me && me.first_name) || "?")[0])) +
+      (me && me.photo_url ? '<img loading="lazy" src="' + esc(me.photo_url) + '">' : esc(((me && me.first_name) || "?")[0])) +
       "</span><div><div><b>" + esc((me && me.first_name) || "Профиль") + "</b></div>" +
       '<div class="muted">@' + esc((me && me.username) || "—") + "</div></div></div>" +
       "<h3>Мои задачи (" + tasks.length + ")</h3>" +
       (tasks.map(taskCard).join("") || '<p class="muted">Нет задач</p>') +
       "<h3>Мои группы</h3>" +
-      (mine.map((g) => '<div class="card">👥 ' + esc(g.name) + " (" + g.members.length + ")</div>").join("") || '<p class="muted">Нет групп</p>');
+      (mine.map((g) => '<div class="card">👥 ' + esc(g.name) + " (" + g.members.length + ")</div>").join("") || '<p class="muted">Нет групп</p>') +
+      ((!inTelegram() && sessionToken()) ? '<div class="row" style="margin-top:12px"><button class="ghost" id="b-logout">Выйти из аккаунта</button></div>' : "");
+    const logoutBtn = document.getElementById("b-logout");
+    if (logoutBtn) logoutBtn.onclick = () => { setSessionToken(""); route(); };
   }
 
-  const calState = { y: new Date().getFullYear(), m: new Date().getMonth(), scope: "me", gid: "", sel: today(), data: {}, groups: [] };
+  const calState = { y: new Date().getFullYear(), m: new Date().getMonth(), scope: "me", gid: "", sel: today(), data: {}, groups: [], allTasks: [], calErr: "", allErr: "" };
   function monthCells(y, m) {
     const startDay = (new Date(y, m, 1).getDay() + 6) % 7;
     const n = new Date(y, m + 1, 0).getDate();
@@ -161,39 +227,18 @@
     for (let d = 1; d <= n; d++) cells.push(y + "-" + String(m + 1).padStart(2, "0") + "-" + String(d).padStart(2, "0"));
     return cells;
   }
-  async function pageCalendar() {
-    try { calState.groups = await api.groups(); } catch (e) { calState.groups = []; }
-    // Нормализуем gid: select даёт строку, бэкенд ждёт int.
-    // Если выбранной группы уже нет в списке (удалена) — считаем, что ничего не выбрано.
-    if (calState.scope === "group" && calState.gid !== "" && calState.gid != null) {
-      const ok = (calState.groups || []).some((g) => String(g.id) === String(calState.gid));
-      if (!ok) calState.gid = "";
-    }
-    const lastDay = new Date(calState.y, calState.m + 1, 0).getDate();
-    const mm = String(calState.m + 1).padStart(2, "0");
-    const from = calState.y + "-" + mm + "-01";
-    const to = calState.y + "-" + mm + "-" + String(lastDay).padStart(2, "0");
-    const gidNum = calState.gid !== "" && calState.gid != null ? Number(calState.gid) : 0;
-    // scope=Группа: без выбора — задачи всех моих групп, с выбором — одной группы.
-    let q = "?from=" + from + "&to=" + to + "&scope=" + calState.scope;
-    if (calState.scope === "group" && gidNum) q += "&group_id=" + gidNum;
-    let calErr = "";
-    try { calState.data = await api.calendar(q); } catch (e) { calState.data = {}; calErr = String((e && e.message) || e); }
-    // all tasks in the same scope (not only selected day / month).
-    let allTasks = [];
-    let allErr = "";
-    {
-      let allQ = "";
-      if (calState.scope === "me") allQ = "?assignee=me";
-      else if (calState.scope === "group") allQ = gidNum ? "?group_id=" + gidNum : "?scope=group";
-      try { allTasks = allQ ? await api.tasks(allQ) : await api.tasks(); } catch (e) { allTasks = []; allErr = String((e && e.message) || e); }
-    }
+  function renderCalendar() {
     const cells = monthCells(calState.y, calState.m);
     const gridCount = Object.keys(calState.data).reduce((n, k) => n + (calState.data[k] || []).length, 0);
     const ym = calState.y + "-" + String(calState.m + 1).padStart(2, "0");
+    const gidNum = calState.gid !== "" && calState.gid != null ? Number(calState.gid) : 0;
     const selGroup = calState.scope === "group" && gidNum
       ? (calState.groups || []).find((g) => String(g.id) === String(gidNum))
       : null;
+    const allTasks = calState.allTasks || [];
+    // Кап рендера: первые 200 задач + счётчик, чтобы DOM не раздувался на сотнях задач.
+    const RENDER_CAP = 200;
+    const shownTasks = allTasks.slice(0, RENDER_CAP);
     app.innerHTML =
       "<h2>Календарь</h2>" +
       '<div class="tabs">' + ["me", "group", "all"].map((s) =>
@@ -204,8 +249,8 @@
           calState.groups.map((g) => '<option value="' + g.id + '"' + (String(calState.gid) === String(g.id) ? " selected" : "") + ">" + esc(g.name) + "</option>").join("") + "</select>" +
           (selGroup ? '<p class="muted">Группа: ' + esc(selGroup.name) + " (id " + selGroup.id + ")</p>"
             : '<p class="muted">Показаны задачи всех твоих групп</p>') : "") +
-      (calErr ? '<p class="muted">Ошибка календаря: ' + esc(calErr) + "</p>" : "") +
-      (allErr ? '<p class="muted">Ошибка списка: ' + esc(allErr) + "</p>" : "") +
+      (calState.calErr ? '<p class="muted">Ошибка календаря: ' + esc(calState.calErr) + "</p>" : "") +
+      (calState.allErr ? '<p class="muted">Ошибка списка: ' + esc(calState.allErr) + "</p>" : "") +
       '<div class="row"><button class="ghost" id="cal-prev">‹</button>' +
       '<b style="flex:1;text-align:center">' + ym + '</b><button class="ghost" id="cal-next">›</button></div>' +
       '<div class="cal-grid" style="margin-top:8px">' +
@@ -219,22 +264,55 @@
       "<h3>" + esc(calState.sel) + "</h3>" +
       (((calState.data[calState.sel] || []).map(taskCard).join("")) || '<p class="muted">Нет задач на этот день</p>') +
       "<h3>Все задачи (" + allTasks.length + ")</h3>" +
-      ((gridCount > 0 && allTasks.length === 0 && !allErr)
+      ((gridCount > 0 && allTasks.length === 0 && !calState.allErr)
         ? '<p class="muted">В сетке задачи есть, а в списке нет — жёстко обнови страницу (Ctrl+F5, в Telegram — очистить кэш), вероятно открылась старая версия приложения.</p>' : "") +
-      (((allTasks.map(taskCard).join("")) || '<p class="muted">Нет задач</p>'));
+      ((shownTasks.map(taskCard).join("") || '<p class="muted">Нет задач</p>')) +
+      (allTasks.length > RENDER_CAP ? '<p class="muted">Показаны первые ' + RENDER_CAP + " из " + allTasks.length + " — уточни месяц или группу.</p>" : "");
 
     app.querySelectorAll("[data-cal-scope]").forEach((b) => b.onclick = () => { calState.scope = b.dataset.calScope; pageCalendar(); });
     const gidSel = document.getElementById("cal-gid");
     if (gidSel) gidSel.onchange = () => { calState.gid = gidSel.value; pageCalendar(); };
     document.getElementById("cal-prev").onclick = () => { if (calState.m === 0) { calState.y--; calState.m = 11; } else calState.m--; pageCalendar(); };
     document.getElementById("cal-next").onclick = () => { if (calState.m === 11) { calState.y++; calState.m = 0; } else calState.m++; pageCalendar(); };
-    app.querySelectorAll("[data-day]").forEach((el) => el.onclick = () => { calState.sel = el.dataset.day; pageCalendar(); });
+    // Выбор дня — чисто клиентский, без refetch (данные месяца уже загружены).
+    app.querySelectorAll("[data-day]").forEach((el) => el.onclick = () => {
+      calState.sel = el.dataset.day;
+      app.querySelectorAll("[data-day]").forEach((x) => x.classList.toggle("sel", x.dataset.day === calState.sel));
+      renderCalendar();
+    });
+  }
+  async function pageCalendar() {
+    const lastDay = new Date(calState.y, calState.m + 1, 0).getDate();
+    const mm = String(calState.m + 1).padStart(2, "0");
+    const from = calState.y + "-" + mm + "-01";
+    const to = calState.y + "-" + mm + "-" + String(lastDay).padStart(2, "0");
+    const gidNum = calState.gid !== "" && calState.gid != null ? Number(calState.gid) : 0;
+    // scope=Группа: без выбора — задачи всех моих групп, с выбором — одной группы.
+    let q = "?from=" + from + "&to=" + to + "&scope=" + calState.scope;
+    if (calState.scope === "group" && gidNum) q += "&group_id=" + gidNum;
+    let allQ = "";
+    if (calState.scope === "me") allQ = "?assignee=me";
+    else if (calState.scope === "group") allQ = gidNum ? "?group_id=" + gidNum : "?scope=group";
+    // Параллельно: было 3 последовательных RTT (groups → calendar → tasks), стало ~1.
+    const [gR, cR, aR] = await Promise.allSettled([api.groups(), api.calendar(q), allQ ? api.tasks(allQ) : api.tasks()]);
+    calState.groups = gR.status === "fulfilled" ? gR.value : [];
+    // Нормализуем gid: select даёт строку, бэкенд ждёт int.
+    // Если выбранной группы уже нет в списке (удалена) — считаем, что ничего не выбрано.
+    if (calState.scope === "group" && calState.gid !== "" && calState.gid != null) {
+      const ok = (calState.groups || []).some((g) => String(g.id) === String(calState.gid));
+      if (!ok) calState.gid = "";
+    }
+    if (cR.status === "fulfilled") { calState.data = cR.value; calState.calErr = ""; }
+    else { calState.data = {}; calState.calErr = String((cR.reason && cR.reason.message) || cR.reason); }
+    if (aR.status === "fulfilled") { calState.allTasks = aR.value; calState.allErr = ""; }
+    else { calState.allTasks = []; calState.allErr = String((aR.reason && aR.reason.message) || aR.reason); }
+    renderCalendar();
   }
 
   async function pageTaskNew() {
-    let groups = [], users = [];
-    try { groups = await api.groups(); } catch (e) {}
-    try { users = await api.users(); } catch (e) {}
+    const [gR, uR] = await Promise.allSettled([api.groups(), api.users()]);
+    const groups = gR.status === "fulfilled" ? gR.value : [];
+    const users = uR.status === "fulfilled" ? uR.value : [];
     app.innerHTML = "<h2>Новая задача</h2>" +
       '<input id="f-title" placeholder="Название *">' +
       '<textarea id="f-desc" placeholder="Описание"></textarea>' +
@@ -269,10 +347,13 @@
   }
 
   async function pageTaskDetail(id) {
-    let t, groups = [], users = [];
+    let t;
     try { t = await api.task(id); } catch (e) { app.innerHTML = "<p>Не найдено</p>"; return; }
-    try { groups = await api.groups(); } catch (e) {}
-    try { users = await api.users(); } catch (e) {}
+    // groups/users грузятся параллельно задаче? Нет — задача нужна первой для early-exit,
+    // но groups+users между собой параллельно (было 2 последовательных RTT).
+    const [gR, uR] = await Promise.allSettled([api.groups(), api.users()]);
+    const groups = gR.status === "fulfilled" ? gR.value : [];
+    const users = uR.status === "fulfilled" ? uR.value : [];
     let edit = false;
     function view() {
       app.innerHTML = '<button class="ghost" id="b-back">‹ Назад</button><h2>' + esc(t.title) + "</h2>" +
@@ -366,9 +447,9 @@
   }
 
   async function pageGroups() {
-    let groups = [], users = [];
-    try { groups = await api.groups(); } catch (e) {}
-    try { users = await api.users(); } catch (e) {}
+    const [gR, uR] = await Promise.allSettled([api.groups(), api.users()]);
+    const groups = gR.status === "fulfilled" ? gR.value : [];
+    const users = uR.status === "fulfilled" ? uR.value : [];
     app.innerHTML = "<h2>Группы</h2>" +
       '<div class="row"><input id="g-name" placeholder="Новая группа"><button id="g-add">+</button></div>' +
       groups.map((g) => {
@@ -411,6 +492,13 @@
   // ---------- router ----------
   async function route() {
     navActive();
+    // Браузер без сессии — сразу на экран входа, не дёргаем API.
+    if (!inTelegram() && !sessionToken()) {
+      await pageLogin();
+      navActive();
+      window.scrollTo(0, 0);
+      return;
+    }
     const h = location.hash || "#/";
     try {
       if (h === "#/" || h === "") await pageProfile();
@@ -420,7 +508,13 @@
       else if (h.startsWith("#/groups")) await pageGroups();
       else await pageProfile();
     } catch (e) {
-      app.innerHTML = "<p>Ошибка: " + esc(e.message) + "</p>";
+      // Протухшая/битая сессия в браузере — чистим и показываем вход заново.
+      if (e && e.status === 401 && !inTelegram()) {
+        setSessionToken("");
+        await pageLogin();
+      } else {
+        app.innerHTML = "<p>Ошибка: " + esc(e.message) + "</p>";
+      }
     }
     navActive();
     window.scrollTo(0, 0);
